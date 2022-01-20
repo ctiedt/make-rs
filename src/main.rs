@@ -1,15 +1,35 @@
 //! A subset of the `make` utility.
 
+use std::{
+    cell::{RefCell, UnsafeCell},
+    collections::HashMap,
+    rc::Rc,
+};
+
+trait Get: Sized {
+    type Output;
+    fn get(&self) -> &Self::Output;
+}
+
+impl<'a> Get for Rc<UnsafeCell<Target<'a>>> {
+    type Output = Target<'a>;
+
+    fn get(&self) -> &Self::Output {
+        unsafe { &*UnsafeCell::get(self) }
+    }
+}
+
 /// A [Makefile] is represented as a list of [Target]s.
 #[derive(Debug)]
-struct Makefile {
-    targets: Vec<Target>,
+struct Makefile<'a> {
+    targets: Vec<Rc<UnsafeCell<Target<'a>>>>,
 }
 
 /// A Target's dependency. Can be another [Target] or a file.
+#[derive(Debug)]
 enum Dependency<'a> {
-    Target(&'a Target),
-    File(&'a str),
+    Target(Rc<UnsafeCell<Target<'a>>>),
+    File(String),
 }
 
 /// Domain-specific errors that can happen when
@@ -35,17 +55,37 @@ impl std::error::Error for MakeError {}
 /// dependencies and a list of commands.
 /// Dependencies are strings because graphs
 /// are difficult in Rust.
-#[derive(Debug)]
-struct Target {
+struct Target<'a> {
     name: String,
-    dependencies: Vec<String>,
+    dependencies: RefCell<Vec<Dependency<'a>>>,
     commands: Vec<String>,
 }
 
-impl Target {
+impl<'a> std::fmt::Debug for Target<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("name", &self.name)
+            .field("dependencies", &self.dependencies.borrow())
+            .field("commands", &self.commands)
+            .finish()
+    }
+}
+
+impl<'a> Target<'a> {
     /// Build this target. Assumes that dependencies
     /// have already been built and are valid.
     fn make(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for dep in self.dependencies.borrow().iter() {
+            match dep {
+                Dependency::Target(t) => t.get().make()?,
+                Dependency::File(f) => {
+                    if !std::path::Path::new(f).exists() {
+                        return Err(Box::new(MakeError::DependencyDoesNotExist));
+                    }
+                }
+            }
+        }
+
         for command in &self.commands {
             println!("{}", command);
 
@@ -65,16 +105,16 @@ impl Target {
     }
 }
 
-impl Makefile {
+impl<'a> Makefile<'a> {
     /// Parse a Makefile from a string.
-    fn from_str<T: AsRef<str>>(data: T) -> Result<Self, Box<dyn std::error::Error>> {
+    fn from_str(data: &'a str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut targets = Vec::new();
+        let mut deps = HashMap::new();
 
         // First, we split the input into lines
         // and filter out the empty ones and comments.
         // We also filter out inline comments.
         let mut lines = data
-            .as_ref()
             .lines()
             .filter(|line| !(line.is_empty() || line.trim().starts_with('#')))
             .map(|line| {
@@ -103,14 +143,37 @@ impl Makefile {
                 }
             }
 
-            targets.push(Target {
-                name: target.to_owned(),
-                dependencies: dependencies
+            deps.insert(
+                target,
+                dependencies
                     .split_whitespace()
                     .map(|dep| dep.trim().to_string())
-                    .collect(),
+                    .collect::<Vec<_>>(),
+            );
+
+            targets.push(Rc::new(UnsafeCell::new(Target {
+                name: target.to_owned(),
+                dependencies: RefCell::new(Vec::new()),
                 commands,
-            })
+            })));
+        }
+
+        for target in &targets {
+            let dependencies = deps
+                .remove(target.get().name.as_str())
+                .unwrap()
+                .into_iter()
+                .map(
+                    |target_name| match targets.iter().find(|t| t.get().name == target_name) {
+                        Some(t) => Dependency::Target(t.clone()),
+                        None => Dependency::File(target_name),
+                    },
+                );
+            target
+                .get()
+                .dependencies
+                .borrow_mut()
+                .append(&mut dependencies.collect::<Vec<_>>());
         }
 
         Ok(Self { targets })
@@ -121,29 +184,10 @@ impl Makefile {
         let target = self
             .targets
             .iter()
-            .find(|t| t.name == target)
+            .find(|t| t.get().name == target)
             .ok_or(MakeError::NoSuchTarget)?;
 
-        // Find all the dependencies and see if they are targets or required files.
-        let deps = target.dependencies.iter().map(|dep| {
-            match self.targets.iter().find(|t| &t.name == dep) {
-                Some(target) => Dependency::Target(target),
-                None => Dependency::File(dep),
-            }
-        });
-
-        // Then build the dependencies or check if the file exists.
-        for dep in deps {
-            match dep {
-                Dependency::Target(t) => self.make(&t.name)?,
-                Dependency::File(f) => {
-                    if !std::path::Path::new(f).exists() {
-                        return Err(Box::new(MakeError::DependencyDoesNotExist));
-                    }
-                }
-            }
-        }
-        target.make()?;
+        target.get().make()?;
 
         Ok(())
     }
@@ -162,7 +206,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             makefile.make(&arg)?;
         }
     } else {
-        makefile.make(&makefile.targets.first().ok_or(MakeError::NoTargets)?.name)?;
+        let target = makefile.targets.first().ok_or(MakeError::NoTargets)?.get();
+        makefile.make(target.name.as_str())?;
     }
     Ok(())
 }
